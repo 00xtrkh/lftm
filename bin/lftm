@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Local File Time Machine (LFTM) v1.0
+# Main script to manage file system time travel
+
+# Determine the absolute path of the script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+# Constants
+LFTM_HOME="$HOME/.lftm"
+DATA_DIR="$LFTM_HOME/data"
+SNAPSHOTS_DIR="$DATA_DIR/snapshots"
+LOGS_DIR="$LFTM_HOME/logs"
+LOG_FILE="$LOGS_DIR/lftm.log"
+DB_FILE="$DATA_DIR/timeline.db"
+
+# Ensure LFTM home directories exist and initialize database
+mkdir -p "$DATA_DIR" "$SNAPSHOTS_DIR" "$LOGS_DIR"
+echo "Initializing database at: $DB_FILE" >> "$LOG_FILE"
+python3 "$LIB_DIR/database.py" init "$DB_FILE" 2>> "$LOG_FILE"
+
+# Help function
+show_help() {
+    echo "Local File Time Machine (LFTM) v1.0"
+    echo "Usage: $0 <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  start <dir>       Start monitoring a directory"
+    echo "  stop              Stop monitoring"
+    echo "  timeline          Display the timeline of changes"
+    echo "  goto <timestamp>  View file system at a specific timestamp"
+    echo "  restore <timestamp> Restore file system to a timestamp"
+    echo "  diff <t1> <t2>    Show changes between two timestamps"
+    echo "  branch <name>     Create a new timeline branch"
+    echo "  switch <name>     Switch to a branch"
+    echo ""
+    echo "Examples:"
+    echo "  $0 start ~/project"
+    echo "  $0 timeline"
+    echo "  $0 goto 2025-06-01-11:30:00"
+    exit 0
+}
+
+# Parse commands
+COMMAND="$1"
+shift
+
+# Validate command
+if [ -z "$COMMAND" ]; then
+    echo "Error: Command required"
+    show_help
+fi
+
+# Execute command
+case "$COMMAND" in
+    start)
+        if [ -z "$1" ]; then
+            echo "Error: Directory required"
+            exit 1
+        fi
+        if [ ! -d "$1" ]; then
+            echo "Error: Directory $1 does not exist"
+            exit 1
+        fi
+        python3 "$LIB_DIR/file_tracker.py" start "$1" "$DB_FILE" "$SNAPSHOTS_DIR" &
+        echo "Started monitoring $1 (PID: $!)" >> "$LOG_FILE"
+        echo "Started monitoring $1 (PID: $!)"
+        ;;
+    stop)
+        python3 "$LIB_DIR/file_tracker.py" stop
+        echo "Stopped monitoring" >> "$LOG_FILE"
+        echo "Stopped monitoring"
+        ;;
+    timeline)
+        python3 "$LIB_DIR/timeline.py" timeline "$DB_FILE"
+        ;;
+    goto)
+        if [ -z "$1" ]; then
+            echo "Error: Timestamp required"
+            exit 1
+        fi
+        python3 "$LIB_DIR/timeline.py" goto "$DB_FILE" "$1"  # Corrected order: db_path first, then timestamp
+        ;;
+    restore)
+        if [ -z "$1" ]; then
+            echo "Error: Timestamp required"
+            exit 1
+        fi
+        python3 "$LIB_DIR/timeline.py" restore "$DB_FILE" "$1" "$SNAPSHOTS_DIR"
+        ;;
+    diff)
+        if [ -z "$1" ] || [ -z "$2" ]; then
+            echo "Error: Two timestamps required"
+            exit 1
+        fi
+        python3 "$LIB_DIR/timeline.py" diff "$DB_FILE" "$1" "$2"
+        ;;
+    branch)
+        if [ -z "$1" ]; then
+            echo "Error: Branch name required"
+            exit 1
+        fi
+        python3 "$LIB_DIR/timeline.py" branch "$DB_FILE" "$1"
+        ;;
+    switch)
+        if [ -z "$1" ]; then
+            echo "Error: Branch name required"
+            exit 1
+        fi
+        python3 "$LIB_DIR/timeline.py" switch "$DB_FILE" "$1"
+        ;;
+    *)
+        echo "Error: Unknown command: $COMMAND"
+        show_help
+        ;;
+esac
