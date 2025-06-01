@@ -29,16 +29,13 @@ show_help() {
     echo "  start <dir>       Start monitoring a directory"
     echo "  stop              Stop monitoring"
     echo "  timeline          Display the timeline of changes"
-    echo "  goto <timestamp>  View file system at a specific timestamp"
     echo "  restore <timestamp> Restore file system to a timestamp"
     echo "  diff <t1> <t2>    Show changes between two timestamps"
-    echo "  branch <name>     Create a new timeline branch"
-    echo "  switch <name>     Switch to a branch"
     echo ""
     echo "Examples:"
     echo "  $0 start ~/project"
     echo "  $0 timeline"
-    echo "  $0 goto 2025-06-01-11:30:00"
+    echo "  $0 restore 2025-06-01-11:30:00"
     exit 0
 }
 
