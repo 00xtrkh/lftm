@@ -1,114 +1,419 @@
 #!/bin/bash
 
-# Local File Time Machine (LFTM) v1.0
-# Main script to manage file system time travel
+EVENTS_FILE="$HOME/.lftm/data/events.json"
+SNAP_DIR="$HOME/.lftm/data/snapshots"
+LOCK_FILE="$HOME/.lftm/lftm.lock"
 
-# Determine the absolute path of the script
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="$SCRIPT_DIR/../lib"
+usage() {
+    cat <<EOF
+Usage : $0 [options] <command> [args...]
 
-# Constants
-LFTM_HOME="$HOME/.lftm"
-DATA_DIR="$LFTM_HOME/data"
-SNAPSHOTS_DIR="$DATA_DIR/snapshots"
-LOGS_DIR="$LFTM_HOME/logs"
-LOG_FILE="$LOGS_DIR/lftm.log"
-DB_FILE="$DATA_DIR/timeline.db"
+Commandes disponibles :
+  start <chemin>        Démarrer la surveillance du dossier <chemin>
+                        Option : -f lancer en arrière-plan (daemon)
+  timeline              Afficher la timeline des événements enregistrés
+  restore <fichier> <timestamp>  Restaurer un snapshot pour <fichier> à la date <timestamp>
+                        Le timestamp doit être entre guillemets, ex : '2025-06-01 16:07:22'
+  status                 Vérifier si un processus de surveillance est en cours (daemon)
+  stop -a|<pid>          Arrêter tous les daemons (-a) ou un daemon par son PID
 
-# Ensure LFTM home directories exist and initialize database
-mkdir -p "$DATA_DIR" "$SNAPSHOTS_DIR" "$LOGS_DIR"
-echo "Initializing database at: $DB_FILE" >> "$LOG_FILE"
-python3 "$LIB_DIR/database.py" init "$DB_FILE" 2>> "$LOG_FILE"
+  list-snapshot          Afficher la liste des snapshots enregistrés
+  -h, --help            Afficher cette aide
+  -r, --reset           reinitialiser le timeline et supprimer les snapshots
+  -l,                   journalisation
+  -t,                   Permet une exécution parallèle via des threads simulés.
+  -s,                   Exécute la surveillance dans un sous-shell.
 
-# Help function
-show_help() {
-    echo "Local File Time Machine (LFTM) v1.0"
-    echo "Usage: $0 <command> [options]"
-    echo ""
-    echo "Commands:"
-    echo "  start <dir>       Start monitoring a directory"
-    echo "  stop              Stop monitoring"
-    echo "  timeline          Display the timeline of changes"
-    echo "  restore <timestamp> Restore file system to a timestamp"
-    echo "  diff <t1> <t2>    Show changes between two timestamps"
-    echo ""
-    echo "Examples:"
-    echo "  $0 start ~/project"
-    echo "  $0 timeline"
-    echo "  $0 restore 2025-06-01-11:30:00"
+Exemples :
+  $0 start /home/user/test
+  $0 start -f /home/user/test
+  $0 timeline
+  $0 restore /home/user/test/file.txt '2025-06-01 16:07:22'
+  $0 status
+  $0 list-snapshot
+  $0 stop -a|<pid>
+  $0 -t /chemin1 /chemin2
+  $0 -s /chemin
+
+EOF
+    exit 1
+}
+
+init_storage() {
+    mkdir -p "$(dirname "$EVENTS_FILE")" "$SNAP_DIR" "$(dirname "$LOCK_FILE")"
+    touch "$LOCK_FILE"
+    if [ ! -f "$EVENTS_FILE" ]; then
+        echo "[]" > "$EVENTS_FILE"
+    fi
+}
+
+log_event() {
+    local timestamp="$1"
+    local action="$2"
+    local filepath="$3"
+    local snapshot="$4"
+
+    flock "$LOCK_FILE" bash -c "
+        events=\$(cat \"$EVENTS_FILE\")
+        new_event=\"{\\\"timestamp\\\":\\\"$timestamp\\\",\\\"action\\\":\\\"$action\\\",\\\"filepath\\\":\\\"$filepath\\\",\\\"snapshot_path\\\":\\\"$snapshot\\\"}\"
+        updated=\$(echo \$events | jq \". + [\$new_event]\")
+        echo \$updated > \"$EVENTS_FILE\"
+    "
+}
+
+start_monitor() {
+    local folder="$1"
+
+    if [ ! -d "$folder" ]; then
+        echo " Dossier $folder introuvable."
+        exit 1
+    fi
+
+    echo "Démarrage de la surveillance de $folder"
+    echo "Setting up watches.  Beware: since -r was given, this may take a while!"
+    inotifywait -m -r -e create,modify,delete --format '%T|%e|%w%f' --timefmt '%Y-%m-%d %H:%M:%S' "$folder" | while IFS='|' read -r ts event filepath; do
+        local action=""
+        case "$event" in
+            *CREATE*) action="CREATE" ;;
+            *MODIFY*) action="MODIFY" ;;
+            *DELETE*) action="DELETE" ;;
+            *) action="UNKNOWN" ;;
+        esac
+
+        echo "[$ts] $action : $filepath"
+
+        if [ "$action" != "DELETE" ]; then
+            local basefile
+            basefile=$(basename "$filepath")
+            local snapfile="${SNAP_DIR}/${basefile}_$(echo "$ts" | tr ' :-' '_').snap"
+            cp "$filepath" "$snapfile" 2>/dev/null || echo "Impossible de créer snapshot pour $filepath"
+            log_event "$ts" "$action" "$filepath" "$snapfile"
+        else
+            log_event "$ts" "$action" "$filepath" ""
+        fi
+    done
+}
+
+timeline() {
+    if ! command -v jq &> /dev/null; then
+        echo "Erreur: jq est requis pour afficher la timeline. Installez-le via 'sudo apt install jq'."
+        exit 1
+    fi
+
+    init_storage
+
+   jq -r '
+  unique_by(.timestamp, .action, .filepath)[] | 
+  "\(.timestamp)\t\(.action)\t\(.filepath)"
+' "$EVENTS_FILE"
+
+}
+
+reinitialiser() {
+   echo "[]" > ~/.lftm/data/events.json 
+   rm -rf ~/.lftm/data/snapshots/*
+   echo "...Timeline réinitialisée."
+   exit 0
+}
+
+
+status_monitor() {
+  echo "🔍 Vérification des processus de surveillance..."
+
+  # -- Détection des démons --
+  local running_daemons
+  running_daemons=$(ps aux | grep "[b]ash $0 __background_start" | awk '{print $2}')
+  
+  if [ -z "$running_daemons" ]; then
+    echo " Aucun processus daemon (surveillance en arrière-plan) trouvé."
+  else
+    echo " Processus daemon actifs :"
+    for pid in $running_daemons; do
+      local cmdline
+      cmdline=$(ps -p "$pid" -o args=)
+      local folder=$(echo "$cmdline" | awk '{print $NF}')
+      echo "  PID: $pid |  Dossier surveillé : $folder"
+    done
+  fi
+
+  # -- Détection des 'threads' simulés --
+  local pid_file="/tmp/lftm_threads.pid"
+  if [ -f "$pid_file" ]; then
+    local thread_pids
+    thread_pids=$(cat "$pid_file")
+    echo
+    echo " Threads simulés (surveillances parallèles) :"
+    for pid in $thread_pids; do
+      if ps -p "$pid" > /dev/null 2>&1; then
+        local cmdline
+        cmdline=$(ps -p "$pid" -o args=)
+        local folder=$(echo "$cmdline" | awk '{print $NF}')
+        echo "  PID: $pid | Dossier surveillé : $folder"
+      else
+        echo "  PID: $pid (terminé)"
+      fi
+    done
+  else
+    echo
+    echo " Aucun thread simulé trouvé (fichier PID inexistant)."
+  fi
+
+  exit 0
+}
+
+  
+stop_monitor() {
+  if [ "$1" == "-a" ]; then
+    echo " Arrêt de tous les processus daemon et threads simulés..."
+
+    # --- Stop des processus daemon ---
+    local daemons
+    daemons=$(ps aux | grep "[b]ash $0 __background_start" | awk '{print $2}')
+    if [ -z "$daemons" ]; then
+      echo " Aucun processus daemon trouvé."
+    else
+      echo " Arrêt des daemons..."
+      for pid in $daemons; do
+        kill "$pid" && echo " Daemon PID $pid arrêté." || echo " Échec de l’arrêt du daemon PID $pid."
+      done
+    fi
+
+    # --- Stop des threads simulés ---
+    local thread_pid_file="/tmp/lftm_threads.pid"
+    if [ -f "$thread_pid_file" ]; then
+      echo " Arrêt des threads simulés..."
+      while read -r pid; do
+        if ps -p "$pid" > /dev/null 2>&1; then
+          kill "$pid" && echo " Thread PID $pid arrêté." || echo " Impossible d'arrêter le thread PID $pid."
+        fi
+      done < "$thread_pid_file"
+      rm -f "$thread_pid_file"
+    else
+      echo " Aucun thread simulé trouvé."
+    fi
+
+  elif [[ "$1" =~ ^[0-9]+$ ]]; then
+    echo " Arrêt du processus PID $1..."
+    kill "$1" && echo "  Processus $1 arrêté." || echo "  Échec : aucun processus avec ce PID ou permission refusée."
+
+  else
+    echo " Utilisation invalide. Exemples :"
+    echo "   ./lftm stop -a              # pour arrêter tous les daemons et threads"
+    echo "   ./lftm stop <PID>           # pour un PID spécifique"
+  fi
+  exit 0
+}
+
+
+
+list_snapshots() {
+  echo "Liste des fichiers snapshot dans $SNAP_DIR :"
+  if [ -d "$SNAP_DIR" ]; then
+    local count=0
+    for file in "$SNAP_DIR"/*; do
+      if [ -f "$file" ]; then
+        echo "  $(basename "$file")"
+        ((count++))
+      fi
+    done
+    [ "$count" -eq 0 ] && echo "  (Aucun snapshot trouvé)"
+  else
+    echo "  (Dossier $SNAP_DIR introuvable)"
+  fi
+  exit 0
+}
+
+
+
+
+viewLogs() {
+    LOG_DIR="/var/log/lftmLogs"
+    EVENTS_FILE="$HOME/.lftm/data/events.json"
+
+    # Vérifie que le fichier d'événements existe
+    if [ ! -f "$EVENTS_FILE" ]; then
+        echo " Aucun fichier d'événements trouvé à copier."
+        return 1
+    fi
+
+    # Crée le dossier de logs s'il n'existe pas, avec droits root (sudo)
+    if [ ! -d "$LOG_DIR" ]; then
+        echo "Création du dossier de logs $LOG_DIR (sudo requis)..."
+        sudo mkdir -p "$LOG_DIR" || { echo " Impossible de créer le dossier de logs."; return 1; }
+        sudo chmod 755 "$LOG_DIR"
+    fi
+
+    # Copie le fichier avec un nom horodaté pour garder un historique
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local dest="$LOG_DIR/events_$timestamp.json"
+
+    echo "Copie des logs dans $dest (sudo requis)..."
+    sudo cp "$EVENTS_FILE" "$dest" || { echo " Échec de la copie des logs."; return 1; }
+
+    echo " Logs copiés avec succès dans $dest"
     exit 0
 }
 
-# Parse commands
-COMMAND="$1"
-shift
+run_with_threads() {
+  echo " Exécution avec threads (simulée avec arrière-plan)..."
+  
+  # Vérifie si un fichier PID existe pour stocker les PIDs
+  local pid_file="/tmp/lftm_threads.pid"
+  > "$pid_file"  # Vide ou crée le fichier
+  
+  for path in "$@"; do
+    if [ -d "$path" ]; then
+      echo " Surveillance de $path en thread..."
+      start_monitor "$path" &  # suppose que cette fonction existe
+      echo $! >> "$pid_file"
+      echo " Thread lancé pour $path avec PID $!"
+    else
+      echo " Dossier $path non trouvé."
+    fi
+  done
 
-# Validate command
-if [ -z "$COMMAND" ]; then
-    echo "Error: Command required"
-    show_help
+  echo " Les PID ont été enregistrés dans $pid_file"
+  # wait  # Décommenter si tu veux attendre les threads
+  exit 0
+}
+
+run_in_subshell() {
+  echo " Exécution dans un sous-shell..."
+  (
+    for path in "$@"; do
+      if [ -d "$path" ]; then
+        echo " Sous-shell : surveillance de $path"
+        start_monitor "$path"
+      else
+        echo " Dossier $path non trouvé."
+      fi
+    done
+  )
+  exit 0
+}
+
+
+restore_file() {
+    local filepath="$1"
+    local timestamp="$2"
+
+    if [ -z "$filepath" ] || [ -z "$timestamp" ]; then
+        echo "Usage: $0 restore <fichier> '<timestamp complet>'"
+        exit 1
+    fi
+
+    init_storage
+
+    if ! command -v jq &> /dev/null; then
+        echo "Erreur: jq est requis pour restaurer un fichier. Installez-le via 'sudo apt install jq'."
+        exit 1
+    fi
+
+    local snap_path
+    snap_path=$(jq -r --arg fp "$filepath" --arg ts "$timestamp" '
+      .[] | select(.filepath == $fp and .timestamp == $ts) | .snapshot_path
+    ' "$EVENTS_FILE" | head -n1)  # prendre la 1ère
+
+    if [ -z "$snap_path" ] || [ "$snap_path" = "null" ]; then
+        filepath_cleaned=$(realpath "$filepath")
+        snap_path=$(jq -r --arg fp "$filepath_cleaned" --arg ts "$timestamp" '
+          .[] | select(.filepath == $fp and .timestamp == $ts) | .snapshot_path
+        ' "$EVENTS_FILE" | head -n1)
+    fi
+
+    snap_path=$(echo "$snap_path" | tr -d '\r\n')
+
+    echo "DEBUG : snapshot_path = '$snap_path'"
+    echo "DEBUG : fichier snapshot existe ? : $( [ -f "$snap_path" ] && echo OUI || echo NON )"
+
+    if [ -z "$snap_path" ] || [ "$snap_path" = "null" ]; then
+        echo "Aucun snapshot trouvé pour $filepath à la date $timestamp"
+        exit 1
+    fi
+
+    if [ ! -f "$snap_path" ]; then
+        echo " Fichier snapshot introuvable : $snap_path"
+        exit 1
+    fi
+
+    local target_dir
+    target_dir=$(dirname "$filepath")
+    mkdir -p "$target_dir"
+
+    cp "$snap_path" "$filepath" && echo " Fichier restauré sous : $filepath" || echo " Erreur lors de la copie"
+}
+
+# --- Main ---
+
+if [ $# -eq 0 ]; then
+    usage
 fi
 
-# Execute command
-case "$COMMAND" in
-    start)
-        if [ -z "$1" ]; then
-            echo "Error: Directory required"
-            exit 1
-        fi
-        if [ ! -d "$1" ]; then
-            echo "Error: Directory $1 does not exist"
-            exit 1
-        fi
-        python3 "$LIB_DIR/file_tracker.py" start "$1" "$DB_FILE" "$SNAPSHOTS_DIR" &
-        echo "Started monitoring $1 (PID: $!)" >> "$LOG_FILE"
-        echo "Started monitoring $1 (PID: $!)"
-        ;;
-    stop)
-        python3 "$LIB_DIR/file_tracker.py" stop
-        echo "Stopped monitoring" >> "$LOG_FILE"
-        echo "Stopped monitoring"
-        ;;
-    timeline)
-        python3 "$LIB_DIR/timeline.py" timeline "$DB_FILE"
-        ;;
-    goto)
-        if [ -z "$1" ]; then
-            echo "Error: Timestamp required"
-            exit 1
-        fi
-        python3 "$LIB_DIR/timeline.py" goto "$DB_FILE" "$1"  # Corrected order: db_path first, then timestamp
-        ;;
-    restore)
-        if [ -z "$1" ]; then
-            echo "Error: Timestamp required"
-            exit 1
-        fi
-        python3 "$LIB_DIR/timeline.py" restore "$DB_FILE" "$1" "$SNAPSHOTS_DIR"
-        ;;
-    diff)
-        if [ -z "$1" ] || [ -z "$2" ]; then
-            echo "Error: Two timestamps required"
-            exit 1
-        fi
-        python3 "$LIB_DIR/timeline.py" diff "$DB_FILE" "$1" "$2"
-        ;;
-    branch)
-        if [ -z "$1" ]; then
-            echo "Error: Branch name required"
-            exit 1
-        fi
-        python3 "$LIB_DIR/timeline.py" branch "$DB_FILE" "$1"
-        ;;
-    switch)
-        if [ -z "$1" ]; then
-            echo "Error: Branch name required"
-            exit 1
-        fi
-        python3 "$LIB_DIR/timeline.py" switch "$DB_FILE" "$1"
-        ;;
-    *)
-        echo "Error: Unknown command: $COMMAND"
-        show_help
-        ;;
+case "$1" in
+    -h|--help) usage ;;
+    -r|--reset) reinitialiser;;
+    -l) viewLogs;;
+    status) status_monitor;;
+    list-snapshot) list_snapshots;;
+      stop)
+    shift
+    stop_monitor "$@"
+    ;;
+    -t)
+    shift
+    run_with_threads "$@"
+    ;;
+    -s)
+    shift
+    run_in_subshell "$@"
+    ;;
+
+
 esac
+
+if [ "$1" = "start" ]; then
+    shift
+    run_in_background=false
+    if [ "$1" = "-f" ]; then
+        run_in_background=true
+        shift
+    fi
+
+    if [ -z "$1" ]; then
+        echo " Il faut préciser un dossier à surveiller."
+        exit 1
+    fi
+
+    init_storage
+
+    if $run_in_background; then
+        nohup bash "$0" __background_start "$1" >/dev/null 2>&1 &
+        echo "Lancement en arrière-plan (daemon) avec PID $!"
+    else
+        start_monitor "$1"
+    fi
+    exit 0
+fi
+
+if [ "$1" = "__background_start" ]; then
+    shift
+    start_monitor "$1"
+    exit 0
+fi
+
+if [ "$1" = "timeline" ]; then
+    timeline
+    exit 0
+fi
+
+if [ "$1" = "restore" ]; then
+    if [ $# -ne 3 ]; then
+        echo "Usage: $0 restore <fichier> '<timestamp complet>'"
+        exit 1
+    fi
+    restore_file "$2" "$3"
+    exit 0
+fi
+
+usage
